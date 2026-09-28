@@ -228,21 +228,7 @@ else
 fi
 
 ########################################################################
-section "10. 登录限速（用独立 XFF 来源，避免污染上面的 IP）"
-RL=0
-for i in $(seq 1 12); do
-  C="$(code -X POST -H 'content-type: application/json' -H 'X-Forwarded-For: 203.0.113.77' \
-    -d '{"username":"admin","password":"nope-nope-nope"}' "$B/gateway/login")"
-  if [ "$C" = "429" ]; then RL=$i; break; fi
-done
-if [ "$RL" -eq 11 ]; then ok "第 11 次失败尝试触发 429"; 
-elif [ "$RL" -gt 0 ]; then bad "限速在第 $RL 次触发（期望第 11 次）"; 
-else bad "连续 12 次失败登录未触发限速"; fi
-check "  被限速的 IP 不受影响其它来源（本机仍可登录）" "200" \
-  "$(code -X POST -H 'content-type: application/json' -d "{\"username\":\"$USER_NAME\",\"password\":\"$PASSWORD\"}" "$B/gateway/login")"
-
-########################################################################
-section "11. 安全不变量"
+section "10. 安全不变量"
 echo -n "  · dsh 自身直连（3091）未登录 -> "
 D="$(code http://127.0.0.1:3091/)"; if [ "$D" = "401" ]; then ok "401（dsh 自己的认证仍在）"; else bad "期望 401，实际 $D"; fi
 echo -n "  · dsh 自身 /api 直连未登录 -> "
@@ -274,7 +260,7 @@ else
 fi
 
 ########################################################################
-section "12. 登出与吊销"
+section "11. 登出与吊销"
 check "POST /gateway/logout -> 200" "200" "$(code -X POST -H "Authorization: Bearer $TOKEN" "$B/gateway/logout")"
 check "  登出后该 Bearer token 立即失效（不只是清 cookie）-> 401" "401" \
   "$(code -H "Authorization: Bearer $TOKEN" "$B/gateway/session")"
@@ -287,9 +273,35 @@ T3="$(printf '%s' "$(body -X POST -H 'content-type: application/json' -d "{\"use
 check "  吊销后立刻重登的新 token 可用（同毫秒竞态回归）-> 200" "200" "$(code -H "Authorization: Bearer $T3" "$B/gateway/session")"
 
 ########################################################################
+# 限速放在**最后**：它会打满真实客户端 IP 的失败计数桶，之后任何登录都会被 429。
+# （经 Cloudflare 时这是必然的 —— 见下面的 BEHIND_TRUSTED_PROXY 说明。）
+section "12. 登录限速"
+RL=0
+for i in $(seq 1 15); do
+  C="$(code -X POST -H 'content-type: application/json' -H 'X-Forwarded-For: 203.0.113.77' \
+    -d '{"username":"admin","password":"nope-nope-nope"}' "$B/gateway/login")"
+  if [ "$C" = "429" ]; then RL=$i; break; fi
+done
+if [ "$RL" -gt 0 ]; then ok "连续失败登录最终触发 429（第 $RL 次）"
+else bad "连续 15 次失败登录未触发限速"; fi
+
+if [ "${BEHIND_TRUSTED_PROXY:-0}" = "1" ]; then
+  # 前面有可信代理（Cloudflare）时，代理会在 X-Forwarded-For **右侧追加**真实客户端 IP，
+  # 网关取最右侧，因此伪造 XFF **不能**造出独立的限速桶 —— 这是我们要的安全属性。
+  check "  伪造 X-Forwarded-For 无法绕过限速（仍 429）" "429" \
+    "$(code -X POST -H 'content-type: application/json' -H 'X-Forwarded-For: 198.51.100.9' \
+       -d '{"username":"admin","password":"nope-nope-nope"}' "$B/gateway/login")"
+else
+  # 直连（前面没有可信代理）时，X-Forwarded-For 由客户端全权控制，不同来源互不影响。
+  check "  被限速的来源不影响其它来源" "200" \
+    "$(code -X POST -H 'content-type: application/json' -d "{\"username\":\"$USER_NAME\",\"password\":\"$PASSWORD\"}" "$B/gateway/login")"
+fi
+
+########################################################################
 echo
 echo "════════════════════════════════════════════"
 echo "  通过: $PASS    失败: $FAIL"
+if [ "${BEHIND_TRUSTED_PROXY:-0}" = "1" ]; then echo "  （拓扑：经可信代理）"; else echo "  （拓扑：直连网关）"; fi
 if [ "$FAIL" -gt 0 ]; then
   echo "  失败项:"
   for n in "${FAILED_NAMES[@]}"; do echo "    - $n"; done

@@ -18,6 +18,9 @@ WS="$E2E/workspace"
 
 DSH_PORT="${DSH_PORT:-3091}"
 GW_PORT="${GW_PORT:-3092}"
+# 本地跑用 false（纯 http，浏览器不会送 Secure cookie）；
+# 经公网 HTTPS 验证时置 true，与生产默认一致。
+COOKIE_SECURE="${COOKIE_SECURE:-false}"
 
 rm -rf "$DHOME" "$WS"
 mkdir -p "$PROFILE/node_modules" "$WS"
@@ -70,7 +73,7 @@ cat > "$PROFILE/cordis.patch.yml" <<YAML
     workspaceRoot: $WS
     adminPassword: ''
     sessionMaxAgeDays: 30
-    cookieSecure: false
+    cookieSecure: $COOKIE_SECURE
     maxUploadBytes: 268435456
     loginMaxAttempts: 10
     loginWindowMs: 900000
