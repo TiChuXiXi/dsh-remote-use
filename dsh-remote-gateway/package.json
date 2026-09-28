@@ -1,0 +1,54 @@
+{
+  "name": "dsh-remote-gateway",
+  "version": "1.0.0",
+  "description": "dsh 手机远程控制网关插件：用户名/密码认证层 + dsh 反向代理（含 WebSocket 透传）+ 工作区文件 list/download/upload。dsh 始终只监听 127.0.0.1，所有外部流量必须经过本插件认证。",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "bin",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "bin": {
+    "dsh-remote-gateway": "bin/cli.mjs"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "clean": "rm -rf lib",
+    "test": "npm run build && node --test tests/unit.test.mjs",
+    "test:only": "node --test tests/unit.test.mjs"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "dsh-plugin",
+    "remote",
+    "gateway",
+    "auth"
+  ],
+  "dsh": {
+    "engines": {
+      "dsh": ">=0.1.5-rc.1"
+    },
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.3"
+  }
+}

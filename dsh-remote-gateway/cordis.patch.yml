@@ -1,0 +1,35 @@
+# dsh-remote-gateway bundle patch —— 把网关插件行插入 profile 组合。
+#
+# 行按【包名】引用（不是相对路径）：patch 只贡献配置，不改变 loader 的基准目录。
+# 安装：dsh plugin --profile web add /root/project/remote-use/dsh-remote-gateway
+#
+# 行级 inject 是必须的 —— 模块里 export 的 inject 管不到这一行。少任何一个，
+# 启动时会报 "cannot get property xxx without inject" 并整棵树加载失败：
+#   webServer  —— 读它真正的监听端口（dshPort: 0 时用它），并注册本地路由
+#   connection —— 用 authenticatedUrl() 拿本进程的 launch token，去兑换 dsh 会话 cookie
+- insert:
+    - id: remote-gateway
+      name: dsh-remote-gateway
+      inject: [webServer, connection]
+      config:
+        # 网关监听地址与端口。隧道 ingress 指向这里，绝不指向 dsh 自己的 3080。
+        gatewayHost: 127.0.0.1
+        gatewayPort: 3081
+        # 0 = 自动采用 ctx.webServer.port（dsh 实际监听的端口）
+        dshPort: 0
+        # 公网域名[:端口]，仅用于日志与提示；例如 "dsh.example.com"
+        publicAuthority: ''
+        # 空 = 取 dsh 进程的工作目录
+        workspaceRoot: ''
+        # 明文密码仅用于首次引导，推荐改用 CLI 或环境变量写入 scrypt 哈希：
+        #   DSH_GATEWAY_PASSWORD=... dsh --profile web
+        #   npx dsh-remote-gateway set-password
+        adminPassword: ''
+        sessionMaxAgeDays: 30
+        # Cloudflare 终结 TLS，浏览器看到的是 HTTPS，因此必须 Secure。
+        # 本地 http 调试时置 false。
+        cookieSecure: true
+        maxUploadBytes: 2147483648
+        loginMaxAttempts: 10
+        loginWindowMs: 900000
+        auditLog: true
