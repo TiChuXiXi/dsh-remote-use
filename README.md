@@ -289,13 +289,30 @@ PASS  logout 后 token 立即失效（401）
 
 运行方式：`bash android/verify/run_verify.sh --url http://127.0.0.1:3081 --user admin --pass '<密码>'`
 
-**隧道**：cloudflared 2026.9.3 已安装并**真实连上 Cloudflare 边缘**（QUIC，hkg01/hkg13 两个连接 registered），公网请求 `https://www.jbt99.site/` 已到达边缘并被转发到 ingress 配置的 origin。**但 ingress 当前指向另一台机器 `192.168.1.121:8899`，尚未指向本机网关**，所以「公网 → 网关 → dsh」这最后一跳需要你在控制台把 Service 改成 `http://127.0.0.1:3081` 之后才能验收。
+**公网链路**：`bash scripts/e2e-public.sh` → **全部通过**。该脚本用 Cloudflare **Quick Tunnel**（不需要账号、不需要域名、**不碰你在控制台里的任何配置**）起一条真实的 Cloudflare 边缘链路，跑完自动拆掉：
+
+```
+公网入口: https://<随机>.trycloudflare.com
+边缘可达 ✓
+  Android 网络层打公网 HTTPS/WSS（含真实 TLS）  → 15/15 通过
+  公网端到端验收（95 项）                       → 95/95 通过
+公网链路全部通过 ✓      然后自动关闭公网入口
+```
+
+也就是「公网 HTTPS/WSS → Cloudflare 边缘 → cloudflared → 插件网关 → dsh」这条链已经**真实跑通并验收**，包含：
+
+- **`wss://` 上的 WebSocket 101** 与真实数据帧往返（`$events` → `ready` 帧）
+- **真实 TLS**：Android 网络层的 SSLSocket + SNI + 证书校验全部实际执行过（原先标注为「未验证」）
+- 经公网跑**真实 dsh RPC**（`session/list` 返回 `result.ok=true`）与真实模型**流式输出**
+- 公网下的登录 / 限速 / 吊销 / 文件上传下载 / Range 断点续传
+
+**Named Tunnel**：cloudflared 2026.9.3 已安装并**真实连上 Cloudflare 边缘**（QUIC，hkg01/hkg13 两个连接 registered）。你的 `www.jbt99.site` 目前指向另一个项目，所以**没有**把它切到网关 —— 切换只需在控制台把该 Public Hostname 的 Service 改成 `http://127.0.0.1:3081`，改完即用（这条链路本身已被上面的 Quick Tunnel 验证过）。
 
 ### 未验证 / 明确不支持
 
 - **Android App 的界面（Activity/View/Compose 之外的 UI 层）从未在真机或模拟器上运行过** —— 本机既没有 Android 设备也没有模拟器，没有一屏被渲染过、没有一个按钮被点过。App 的网络层已对真实网关验证，但 UI 层只有「能用 android.jar 作为 bootclasspath 编译通过」这一级证据。
-- **公网 ingress 未指向本机网关**，因此「公网 HTTPS/WSS 打到本网关」这一跳未验收（隧道本身已确认连接成功，见上文）。
-- Android 侧：`session/cancel` 未验证；**分块上传模式 B 未实现**（只用 multipart 模式 A）；下载保存到 App 私有目录 `getExternalFilesDir`，未走 MediaStore 公共下载目录；token 存在明文 `SharedPreferences`（MODE_PRIVATE），**未用 Keystore 加密**；`wss://`（TLS）代码已写但未实际执行过。
+- **你的 Named Tunnel 域名未指向本网关** —— `www.jbt99.site` 正被另一个项目使用；链路本身已由 Quick Tunnel 完整验证，只剩控制台改一行 Service。
+- Android 侧：`session/cancel` 未验证；**分块上传模式 B 在 App 侧未实现**（只用 multipart 模式 A）；下载保存到 App 私有目录 `getExternalFilesDir`，未走 MediaStore 公共下载目录；token 存在明文 `SharedPreferences`（MODE_PRIVATE），**未用 Keystore 加密**。
 - **推送通知（阶段四 4.2）未实现** —— FCM 需要一个 Firebase 项目与 `google-services.json`，属于外部依赖，没有它无法编译进去。
 - 手机浏览器观感、中文文件名在各类 ROM 下载器里的表现未验证。
 
@@ -308,6 +325,10 @@ PASS  logout 后 token 立即失效（401）
 - 会话 token 是 HMAC-SHA256 签名的自包含凭据，密钥 32 字节随机、存 600 权限文件。
 - `revoke-all` 用「吊销时间戳（epoch）」实现 O(1) 全量吊销：`iat <= epoch` 的 token 一律拒绝，跨重启持久化。
 - 登录限速只统计**失败**尝试，按 `X-Forwarded-For` **最右侧**（Cloudflare 追加的那个）计 —— 最左侧可被客户端伪造，信它等于把限速交给攻击者绕过。
+
+  **实测证据**（公网跑 `e2e-verify.sh` 时发现的）：经 Cloudflare 时，客户端自带 `X-Forwarded-For: 203.0.113.77` **无法**造出独立的限速桶——11 次伪造来源的失败尝试仍然打满了真实客户端 IP 的桶。这正是要的行为：Cloudflare 在右侧追加真实客户端 IP，网关取最右侧，于是**伪造 XFF 不能绕过登录限速**。作为对照，直连（前面没有可信代理）时不同来源互不影响。
+
+  由此得到一条**部署与测试的约束**：限速小节会打满真实 IP 的桶，之后任何登录都会 429。所以 `verify-all.sh` / `e2e-public.sh` 里「需要登录的检查」一律排在限速小节之前。验证脚本用 `BEHIND_TRUSTED_PROXY=1` 区分两种拓扑，并各自断言对应的安全属性。
 - 下载强制 `Content-Disposition: attachment`，并对 HTML/SVG/JS 也强制附件，避免被写进工作区的恶意页面在同源下代用户发请求。
 - 审计日志是只追加 JSONL，记录登录成败、限速触发、认证拒绝、文件读写与越界尝试。
 
