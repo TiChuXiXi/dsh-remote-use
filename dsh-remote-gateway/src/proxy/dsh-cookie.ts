@@ -41,6 +41,7 @@ export class DshSessionCookie {
   private cached: string | null = null
   private inflight: Promise<string> | null = null
   private exchangeCount = 0
+  private obtainedAt = 0
 
   constructor(
     private readonly port: number,
@@ -61,7 +62,26 @@ export class DshSessionCookie {
   /** 主动失效缓存：dsh 进程重启后 launch token 与签名密钥都变了。 */
   invalidate(): void {
     this.cached = null
+    this.obtainedAt = 0
     this.onEvent?.('invalidated', 'dsh 会话 cookie 已失效，下次请求将重新兑换')
+  }
+
+  /**
+   * 确保 cookie 的「年龄」不超过 maxAgeMs，否则先重新兑换。
+   *
+   * 为什么需要它：重放要求请求体还能再发一遍，而**流式转发的大请求体已经消费掉了**，
+   * 无法重放。所以对大请求，唯一能做的就是别让它带着一个陈旧 cookie 上路 ——
+   * dsh 重启后 cookie 会失效，而大请求一旦因此吃 401，就只能失败重传。
+   * 小请求不需要这个：它们可重放，401 时自愈即可，省掉这次额外往返。
+   */
+  async ensureFresh(maxAgeMs: number): Promise<string> {
+    if (this.cached !== null && Date.now() - this.obtainedAt <= maxAgeMs) return this.cached
+    if (this.cached !== null) {
+      this.onEvent?.('invalidated', `会话 cookie 已存放超过 ${String(maxAgeMs)}ms，大请求前主动换新`)
+      this.cached = null
+      this.obtainedAt = 0
+    }
+    return this.cookie()
   }
 
   /**
@@ -75,6 +95,7 @@ export class DshSessionCookie {
     const attempt = this.exchange()
       .then((value) => {
         this.cached = value
+        this.obtainedAt = Date.now()
         this.exchangeCount += 1
         this.onEvent?.('obtained', `已兑换 dsh 会话 cookie（第 ${String(this.exchangeCount)} 次）`)
         return value

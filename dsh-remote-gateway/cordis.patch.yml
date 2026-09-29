@@ -13,7 +13,14 @@
       inject: [webServer, connection]
       config:
         # 网关监听地址与端口。隧道 ingress 指向这里，绝不指向 dsh 自己的 3080。
-        gatewayHost: 127.0.0.1
+        #
+        # 这里填**本机内网地址**而不是 127.0.0.1：cloudflared 的 Public Hostname
+        # 里写 http://192.168.1.182:3081 一眼就能认出「这是网关」，不会和别的
+        # 本地服务混淆。换机器/换网段时改这一行。
+        #
+        # 只允许回环或具体内网 IPv4；0.0.0.0 会被强制拉回 127.0.0.1（它会把服务
+        # 一并挂到 docker0、VPN 等所有接口上）。dsh 自身始终只在回环。
+        gatewayHost: 192.168.1.182
         gatewayPort: 3081
         # 0 = 自动采用 ctx.webServer.port（dsh 实际监听的端口）
         dshPort: 0
@@ -30,6 +37,18 @@
         # 本地 http 调试时置 false。
         cookieSecure: true
         maxUploadBytes: 2147483648
+        # 反向代理**可重放**的请求体上限（字节）。默认 64 MiB。
+        #
+        # 为什么要管它：dsh 重启后会话 cookie 会失效，网关的处理是「换 cookie →
+        # 把请求重放一次」。重放要求请求体还能再发一遍，而流一旦被消费就没了，
+        # 所以只有被缓冲下来的体才可重放。调大 = 更多请求能自愈，代价是每个
+        # 并发请求占这么多内存；调小 = 省内存，但更大的请求在 dsh 重启时会失败
+        # （网关会明确返回 502 upstream_reauth_needed 让客户端重传，而不是悄悄
+        # 发一个空体上去）。
+        #
+        # 注意：超过这个值的请求**仍然能正常上传**，只是改成流式转发、失去重放
+        # 能力。真正决定能不能传的是 maxUploadBytes，不是这个值。
+        replayBodyLimitBytes: 67108864
         loginMaxAttempts: 10
         loginWindowMs: 900000
         auditLog: true

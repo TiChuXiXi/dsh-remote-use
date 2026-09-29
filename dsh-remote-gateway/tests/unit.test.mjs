@@ -51,7 +51,9 @@ describe('normalizeConfig', () => {
 
   it('数值越界被钳制', () => {
     assert.equal(normalizeConfig({ gatewayPort: 99999 }).gatewayPort, 65535)
-    assert.equal(normalizeConfig({ gatewayPort: -5 }).gatewayPort, 1)
+    assert.equal(normalizeConfig({ gatewayPort: -5 }).gatewayPort, 0)
+    // 0 是合法值：表示由操作系统分配端口（测试/嵌入用）
+    assert.equal(normalizeConfig({ gatewayPort: 0 }).gatewayPort, 0)
     assert.equal(normalizeConfig({ sessionMaxAgeDays: 0 }).sessionMaxAgeDays, 1)
     assert.equal(normalizeConfig({ loginMaxAttempts: 0 }).loginMaxAttempts, 1)
   })
@@ -67,10 +69,27 @@ describe('normalizeConfig', () => {
     assert.equal(normalizeConfig({ totallyUnknown: 1 }).gatewayPort, 3081)
   })
 
-  it('非回环 gatewayHost 被强制拉回 127.0.0.1（安全不变量）', () => {
+  it('gatewayHost 只放行回环与具体内网 IPv4，其余强制拉回 127.0.0.1', () => {
+    // 允许：回环
+    assert.equal(normalizeConfig({ gatewayHost: '127.0.0.1' }).gatewayHost, '127.0.0.1')
+    assert.equal(normalizeConfig({ gatewayHost: '127.0.0.53' }).gatewayHost, '127.0.0.53')
+    assert.equal(normalizeConfig({ gatewayHost: 'localhost' }).gatewayHost, 'localhost')
+    assert.equal(normalizeConfig({ gatewayHost: '::1' }).gatewayHost, '::1')
+    // 允许：具体内网 IPv4（隧道 ingress 指向它更好辨认）
+    assert.equal(normalizeConfig({ gatewayHost: '192.168.1.182' }).gatewayHost, '192.168.1.182')
+    assert.equal(normalizeConfig({ gatewayHost: '10.0.0.7' }).gatewayHost, '10.0.0.7')
+    assert.equal(normalizeConfig({ gatewayHost: '172.16.0.1' }).gatewayHost, '172.16.0.1')
+    assert.equal(normalizeConfig({ gatewayHost: '172.31.255.254' }).gatewayHost, '172.31.255.254')
+    // 拒绝：全接口（会一并挂到 docker0 / VPN 上）
     assert.equal(normalizeConfig({ gatewayHost: '0.0.0.0' }).gatewayHost, '127.0.0.1')
-    assert.equal(normalizeConfig({ gatewayHost: '192.168.1.5' }).gatewayHost, '127.0.0.1')
     assert.equal(normalizeConfig({ gatewayHost: '::' }).gatewayHost, '127.0.0.1')
+    // 拒绝：公网地址、172.32 越界、CIDR、主机名、非规范写法
+    assert.equal(normalizeConfig({ gatewayHost: '8.8.8.8' }).gatewayHost, '127.0.0.1')
+    assert.equal(normalizeConfig({ gatewayHost: '172.32.0.1' }).gatewayHost, '127.0.0.1')
+    assert.equal(normalizeConfig({ gatewayHost: '192.168.1.0/24' }).gatewayHost, '127.0.0.1')
+    assert.equal(normalizeConfig({ gatewayHost: 'example.com' }).gatewayHost, '127.0.0.1')
+    assert.equal(normalizeConfig({ gatewayHost: '0x7f.0.0.1' }).gatewayHost, '127.0.0.1')
+    assert.equal(normalizeConfig({ gatewayHost: '192.168.1.256' }).gatewayHost, '127.0.0.1')
   })
 
   it('DSH_GATEWAY_PASSWORD 覆盖 adminPassword', () => {

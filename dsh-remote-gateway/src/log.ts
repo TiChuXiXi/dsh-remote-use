@@ -21,6 +21,7 @@ export type AuditAction =
   | 'fs.upload.chunk'
   | 'fs.denied'
   | 'proxy.error'
+  | 'proxy.unreplayable_401'
   | 'upstream.reauth'
   | 'startup'
 

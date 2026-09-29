@@ -40,14 +40,22 @@ const HOP_BY_HOP = new Set([
 ])
 
 /**
- * 可为重放而缓冲的请求体上限。
+ * 可为重放而缓冲的请求体上限 —— 兜底默认值，实际取 config.replayBodyLimitBytes。
  *
  * dsh 在 401 时（进程重启过）需要重新兑换 cookie 并重放请求。GET/HEAD 天然可重放；
  * 小的 JSON RPC 体（dsh 界面的全部 RPC 都在几十 KB 内）也缓冲下来以便重放。
- * 超过此阈值的体（文件上传流）直接流式转发，不重放 —— 重放一个几百 MB 的
- * 上传代价过大，且流已经消费掉了。
+ * 超过此阈值的体（大文件上传流）直接流式转发，**不重放** —— 流已经消费掉了，
+ * 再 pipe 一次只会发出一个空体，那比直接报错更糟。
  */
-const REPLAY_BODY_LIMIT = 1 * 1024 * 1024
+const DEFAULT_REPLAY_BODY_LIMIT = 64 * 1024 * 1024
+
+/**
+ * 流式（不可重放）请求上路前，cookie 允许的最大年龄。
+ *
+ * 大请求一旦吃 401 就无法重放，所以宁可多花一次兑换往返，也不要让它带着陈旧
+ * cookie 出发。小请求不需要这个：它们可重放，401 时自愈即可。
+ */
+const STREAM_COOKIE_MAX_AGE_MS = 30_000
 
 /** 请求体读取计划。 */
 type BodyPlan =
@@ -61,7 +69,7 @@ type BodyPlan =
  * 可读缓冲并停止消费 —— 这样调用方仍能用 `req.pipe(upstream)` 流式转发剩余部分。
  * 不这么做的话，`for await ... break` 会 destroy 掉流。
  */
-function planBody(req: IncomingMessage): Promise<BodyPlan> {
+function planBody(req: IncomingMessage, limit: number): Promise<BodyPlan> {
   const method = (req.method ?? 'GET').toUpperCase()
   if (method === 'GET' || method === 'HEAD' || method === 'OPTIONS') {
     return Promise.resolve({ mode: 'replay', buffer: Buffer.alloc(0) })
@@ -80,7 +88,7 @@ function planBody(req: IncomingMessage): Promise<BodyPlan> {
     const onData = (chunk: Buffer): void => {
       chunks.push(chunk)
       total += chunk.length
-      if (total <= REPLAY_BODY_LIMIT) return
+      if (total <= limit) return
       cleanup()
       req.pause()
       // 把已消费的字节还回去，交给 pipe 继续流式转发。
@@ -309,12 +317,19 @@ export class GatewayServer {
    * 转发一个请求。
    *
    * 上游返回 401 时说明 dsh 重启过（launch token 与签名密钥都变了）：失效缓存、
-   * 重新兑换一次、重放该请求一次（仅当请求体在缓冲阈值内或方法幂等）。
+   * 重新兑换一次、重放该请求一次 —— **但只有可重放的请求体才能这么做**。
+   * 流式转发的大请求体已经被消费掉了，再 pipe 一次只会发出一个空体，
+   * 那比直接报错更糟（上游会收到一个残缺请求）。所以：
+   *   - replay 体：401 → 换 cookie → 重放一次（原行为）。
+   *   - stream 体：出发前先把 cookie 换新；万一仍然 401，明确告诉客户端重传，
+   *     而不是悄悄发一个空体上去。
    */
   private async forward(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const replayLimit = this.config.replayBodyLimitBytes ?? DEFAULT_REPLAY_BODY_LIMIT
+
     let plan: BodyPlan
     try {
-      plan = await planBody(req)
+      plan = await planBody(req, replayLimit)
     } catch (error) {
       sendError(res, 400, 'bad_request', `读取请求体失败: ${errText(error)}`)
       return
@@ -323,7 +338,11 @@ export class GatewayServer {
     const send = async (isRetry: boolean): Promise<void> => {
       let cookie: string
       try {
-        cookie = await this.deps.cookie.cookie()
+        // 不可重放的请求先确保 cookie 新鲜，避免大上传走到 401 这条死路。
+        cookie =
+          plan.mode === 'stream'
+            ? await this.deps.cookie.ensureFresh(STREAM_COOKIE_MAX_AGE_MS)
+            : await this.deps.cookie.cookie()
       } catch (error) {
         this.deps.audit.record({
           action: 'proxy.error',
@@ -354,7 +373,7 @@ export class GatewayServer {
       upstream.on('response', (upRes) => {
         const status = upRes.statusCode ?? 502
 
-        if (status === 401 && !isRetry) {
+        if (status === 401 && !isRetry && plan.mode === 'replay') {
           upRes.resume()
           this.deps.cookie.invalidate()
           this.deps.audit.record({
@@ -367,6 +386,31 @@ export class GatewayServer {
             warn(`重放请求失败: ${errText(error)}`)
             if (!res.headersSent) sendError(res, 502, 'upstream_error', '重放请求失败')
           })
+          return
+        }
+
+        if (status === 401 && !isRetry && plan.mode === 'stream') {
+          // 体已经发完了，无法重放。至少让下一次请求能用上新 cookie。
+          upRes.resume()
+          this.deps.cookie.invalidate()
+          this.deps.audit.record({
+            action: 'proxy.unreplayable_401',
+            path: req.url ?? '',
+            status: 502,
+            detail:
+              `请求体 ${String(replayLimit)} 字节以上为流式转发，无法重放；` +
+              `已失效 cookie，请客户端重传`,
+          })
+          warn(
+            `${req.method ?? '?'} ${req.url ?? ''} 上游 401，但请求体是流式转发（>${String(replayLimit)} 字节）` +
+              `无法重放。cookie 已失效，请客户端重传该请求。`,
+          )
+          sendError(
+            res,
+            502,
+            'upstream_reauth_needed',
+            'dsh 会话已失效且该请求体过大无法自动重放，请重试本次上传（会话已刷新）',
+          )
           return
         }
 

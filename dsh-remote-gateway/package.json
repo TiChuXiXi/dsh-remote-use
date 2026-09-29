@@ -28,8 +28,8 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "clean": "rm -rf lib",
-    "test": "npm run build && node --test tests/unit.test.mjs",
-    "test:only": "node --test tests/unit.test.mjs"
+    "test": "npm run build && node --test tests/unit.test.mjs tests/proxy-replay.test.mjs",
+    "test:only": "node --test tests/unit.test.mjs tests/proxy-replay.test.mjs"
   },
   "keywords": [
     "dsh",
@@ -45,6 +45,14 @@
     },
     "bundle": {
       "patch": "./cordis.patch.yml"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh": ">=0.1.5-rc.1"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh": {
+      "optional": true
     }
   },
   "devDependencies": {
