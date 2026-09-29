@@ -13,6 +13,18 @@ android/.pingbuild/
 android/verify-out/
 android/.verify-build/
 
+# Gradle / Android SDK 本地状态（绝不能入库：local.properties 含本机绝对路径）
+android/.gradle/
+android/local.properties
+android/build/
+android/app/build/
+android/.kotlin/
+.gradle/
+
+# 本机安装的工具链（Gradle、JDK、Android SDK 等，体积大且可重装）
+.toolchain/
+.scratch/
+
 # 本地测试环境（scripts/e2e-setup.sh 可重建）
 .e2e/
 .npm-cache/
@@ -25,3 +37,8 @@ android/.verify-build/
 # 其它
 *.log
 *.class
+.runtime/
+
+# qemu/模拟器崩溃时落下的 core dump（几十 MB，纯垃圾）
+*.core
+core.[0-9]*
