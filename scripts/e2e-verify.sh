@@ -15,6 +15,26 @@ PASSWORD="${PASSWORD:-Str0ngPassw0rd!}"
 WS="${WS:-$ROOT/.e2e/workspace}"
 STATE="${STATE:-$ROOT/.e2e/dshhome/dsh-remote-gateway}"
 
+# ── 拓扑参数 ──────────────────────────────────────────────────────────────
+# 默认是「直连」拓扑：网关 127.0.0.1:3092、dsh 127.0.0.1:3091。
+# 打公网 Named Tunnel 时这样调用：
+#   B=https://remote.jbt99.site GW_HOST=192.168.1.182 GW_PORT=3081 DSH_PORT=3079 \
+#   WS=$ROOT/.runtime/workspace STATE=$ROOT/.runtime/dshhome/dsh-remote-gateway \
+#   BEHIND_TRUSTED_PROXY=1 bash scripts/e2e-verify.sh
+DSH_PORT="${DSH_PORT:-3091}"
+GW_PORT="${GW_PORT:-3092}"
+# 网关实际绑定的地址 —— 用来断言「绑的是具体地址，不是 0.0.0.0」。
+GW_HOST="${GW_HOST:-127.0.0.1}"
+# dsh 直连基址。公网拓扑下 dsh 可能不在 3091，用 DSH_DIRECT 覆盖或设 DSH_DIRECT=skip。
+DSH_DIRECT="${DSH_DIRECT:-http://127.0.0.1:$DSH_PORT}"
+
+# WebSocket 探测地址由 $B 推导（http→ws，https→wss），不再硬编码回环端口。
+case "$B" in
+  https://*) WSURL="wss://${B#https://}/api/remote.mux" ;;
+  http://*)  WSURL="ws://${B#http://}/api/remote.mux" ;;
+  *)         WSURL="$B/api/remote.mux" ;;
+esac
+
 PASS=0
 FAIL=0
 FAILED_NAMES=()
@@ -211,7 +231,6 @@ if [ -f "$(dirname "$WS")/evil.txt" ]; then bad "D4) 借助 X-File-Name 逃逸�
 
 ########################################################################
 section "9. WebSocket 流式（真实帧往返，不只是 101）"
-WSURL="ws://127.0.0.1:3092/api/remote.mux"
 if node "$ROOT/dsh-remote-gateway/tests/ws-probe.mjs" "$WSURL" "$TOKEN" '$events' 10000 > "$TMP/ws.log" 2>&1; then
   ok "WebSocket 升级 + 真实数据帧往返"
   sed 's/^/      /' "$TMP/ws.log" | head -4
@@ -229,15 +248,22 @@ fi
 
 ########################################################################
 section "10. 安全不变量"
-echo -n "  · dsh 自身直连（3091）未登录 -> "
-D="$(code http://127.0.0.1:3091/)"; if [ "$D" = "401" ]; then ok "401（dsh 自己的认证仍在）"; else bad "期望 401，实际 $D"; fi
-echo -n "  · dsh 自身 /api 直连未登录 -> "
-D="$(code -X POST -H 'content-type: application/json' -d '{}' http://127.0.0.1:3091/api/session/list)"
-if [ "$D" = "401" ] || [ "$D" = "403" ]; then ok "$D（未被网关以外的方式打开）"; else bad "期望 401/403，实际 $D"; fi
-check "  · 网关绑定在回环地址（非 0.0.0.0）" "1" \
-  "$( (ss -ltn 2>/dev/null || netstat -ltn) | grep -c '127.0.0.1:3092' )"
-check "  · 网关未监听 0.0.0.0:3092" "0" \
-  "$( (ss -ltn 2>/dev/null || netstat -ltn) | grep -c '0.0.0.0:3092' )"
+# dsh 直连检查：只有在确实能直连到那个 dsh 端口时才有意义。
+# 公网拓扑下 dsh 往往在另一个端口（或不在本机视角），此时设 DSH_DIRECT=skip。
+if [ "$DSH_DIRECT" = "skip" ]; then
+  echo "  · dsh 直连检查：已跳过（DSH_DIRECT=skip）"
+else
+  echo -n "  · dsh 自身直连（$DSH_DIRECT）未登录 -> "
+  D="$(code "$DSH_DIRECT/")"; if [ "$D" = "401" ]; then ok "401（dsh 自己的认证仍在）"; else bad "期望 401，实际 $D"; fi
+  echo -n "  · dsh 自身 /api 直连未登录 -> "
+  D="$(code -X POST -H 'content-type: application/json' -d '{}' "$DSH_DIRECT/api/session/list")"
+  if [ "$D" = "401" ] || [ "$D" = "403" ]; then ok "$D（未被网关以外的方式打开）"; else bad "期望 401/403，实际 $D"; fi
+fi
+# 绑定断言：网关应当监听在**配置的**地址上，且**不**监听 0.0.0.0。
+check "  · 网关监听在 $GW_HOST:$GW_PORT" "1" \
+  "$( (ss -ltn 2>/dev/null || netstat -ltn) | grep -c "$GW_HOST:$GW_PORT" )"
+check "  · 网关未监听 0.0.0.0:$GW_PORT" "0" \
+  "$( (ss -ltn 2>/dev/null || netstat -ltn) | grep -c "0.0.0.0:$GW_PORT" )"
 if [ -f "$STATE/users.json" ]; then
   if grep -q "Str0ngPassw0rd" "$STATE/users.json" 2>/dev/null; then bad "  · users.json 里出现明文密码"; else ok "  · users.json 不含明文密码"; fi
   PERM="$(stat -c '%a' "$STATE/users.json")"

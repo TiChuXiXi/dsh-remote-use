@@ -66,7 +66,7 @@ ln -sfn "$ROOT/dsh-remote-gateway" "$PROFILE/node_modules/dsh-remote-gateway"
 cat > "$PROFILE/cordis.patch.yml" <<YAML
 - id: remote-gateway
   config:
-    gatewayHost: 127.0.0.1
+    gatewayHost: ${GW_HOST:-127.0.0.1}
     gatewayPort: $GW_PORT
     dshPort: 0
     publicAuthority: ''
@@ -74,22 +74,15 @@ cat > "$PROFILE/cordis.patch.yml" <<YAML
     adminPassword: ''
     sessionMaxAgeDays: 30
     cookieSecure: $COOKIE_SECURE
-    maxUploadBytes: 268435456
+    maxUploadBytes: 2147483648
+    replayBodyLimitBytes: ${REPLAY_LIMIT:-67108864}
     loginMaxAttempts: 10
     loginWindowMs: 900000
     auditLog: true
 YAML
 
-# 6) 造一些工作区样本文件，覆盖列表/下载/Range/上传/越界各种情形。
-mkdir -p "$WS/build/outputs" "$WS/docs" "$WS/nested/deep"
-head -c 300000 /dev/urandom > "$WS/build/outputs/app-debug.apk"
-printf 'hello from dsh remote gateway\n' > "$WS/docs/readme.txt"
-head -c 1048576 /dev/urandom > "$WS/big.bin"
-printf 'secret\n' > "$E2E/outside-secret.txt"
-# 越界软链：指向工作区外的文件，用于验证双重防护的第二重。
-ln -sfn "$E2E/outside-secret.txt" "$WS/escape-link.txt"
-# 越界软链目录
-ln -sfn "$E2E" "$WS/escape-dir"
+# 6) 造样本文件（与公网验收共用同一套夹具，见 scripts/make-fixtures.sh）
+bash "$ROOT/scripts/make-fixtures.sh" "$WS" "$E2E" >/dev/null
 
 echo "测试 DSH_HOME: $DHOME"
 echo "测试工作区:    $WS"

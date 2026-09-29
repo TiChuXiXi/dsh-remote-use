@@ -52,6 +52,29 @@ else
   echo "跳过：找不到 android/build_apk.sh"
 fi
 
+# ─────────────────────────────────────────── 3b. Android UI 层（Robolectric）
+step "3b. Android UI 层：Gradle 构建 + Robolectric 真跑 Activity"
+if [ -x "$ROOT/android/gradlew" ]; then
+  ( cd "$ROOT/android" && ./gradlew :app:assembleDebug :app:testDebugUnitTest ) >"$ROOT/.e2e/gradle.log" 2>&1
+  if [ $? -eq 0 ]; then
+    TOT=0; BADN=0
+    for f in "$ROOT"/android/app/build/test-results/testDebugUnitTest/*.xml; do
+      [ -f "$f" ] || continue
+      T=$(grep -o 'tests="[0-9]*"' "$f" | head -1 | grep -o '[0-9]*')
+      F=$(grep -o 'failures="[0-9]*"' "$f" | head -1 | grep -o '[0-9]*')
+      E=$(grep -o 'errors="[0-9]*"' "$f" | head -1 | grep -o '[0-9]*')
+      TOT=$((TOT + ${T:-0})); BADN=$((BADN + ${F:-0} + ${E:-0}))
+    done
+    echo "Robolectric: $TOT 项，失败 $BADN（日志 $ROOT/.e2e/gradle.log）"
+    [ "$BADN" -eq 0 ] || FAILED+=("Robolectric UI 测试（$BADN 项失败）")
+  else
+    echo "Gradle 构建/测试失败，日志末尾："; tail -20 "$ROOT/.e2e/gradle.log"
+    FAILED+=("Gradle 构建或 Robolectric 测试")
+  fi
+else
+  echo "跳过：找不到 android/gradlew（先跑 android/tools/setup_toolchain.sh）"
+fi
+
 # ─────────────────────────────────────────── 4. 起真实 dsh + 网关
 step "4. 搭建测试环境并启动真实 dsh（端口 $DSH_PORT，网关 $GW_PORT）"
 DSH_PORT="$DSH_PORT" GW_PORT="$GW_PORT" bash "$ROOT/scripts/e2e-setup.sh" >/dev/null || { echo "环境搭建失败"; exit 1; }
@@ -84,6 +107,24 @@ fi
 # ─────────────────────────────────────────── 6. 端到端（限速在最后）
 step "6. 端到端验收（真实 dsh）"
 B="http://127.0.0.1:$GW_PORT" PW="$PW" bash "$ROOT/scripts/e2e-verify.sh" || FAILED+=("端到端验收")
+
+# ─────────────────────────────────────────── 7. 大文件专项（自带环境，放最后）
+# 自带 setup + 起 dsh，会覆盖 .e2e/dshhome，所以必须排在前面那些步骤之后。
+step "7. 大文件专项（上传三模式 / 经代理的大上传 / Range 续传）"
+# 这一步会 rm -rf .e2e，而上面第 4 步把 cwd 切到了 .e2e/workspace —— 先挪回不会被删的地方，
+# 否则后续每个子进程都会刷 getcwd 报错。
+cd "$ROOT"
+# 默认体积很大（合计约 1.5 GiB）；设 LARGE_QUICK=1 可只跑一遍小样本。
+if [ "${LARGE_QUICK:-0}" = "1" ]; then
+  RAW_MB=32 MP_MB=16 CHUNK_MB=32 PROXY_MB=16 \
+    bash "$ROOT/scripts/e2e-largefile.sh" || FAILED+=("大文件专项")
+else
+  bash "$ROOT/scripts/e2e-largefile.sh" || FAILED+=("大文件专项")
+fi
+
+# ─────────────────────────────────────────── 8. 网关绑定内网 IP
+step "8. 网关绑定内网 IP（生产拓扑）"
+bash "$ROOT/scripts/verify-lan-bind.sh" || FAILED+=("内网绑定验证")
 
 # ─────────────────────────────────────────── 汇总
 echo
