@@ -1,10 +1,14 @@
-# dsh 0.1.5-rc.3 browser-transport protocol — evidence-backed spec
+# dsh browser-transport protocol — evidence-backed spec
 
 **Ground truth root:** `/root/.nvm/versions/node/v24.19.0/lib/node_modules/@deepseek-ai/dsh/`
 (hereafter `$DSH`). Packages live at
 `$DSH/node_modules/@deepseek-ai/<pkg>/` (hereafter `$PKG/<pkg>/`).
 
-**Version verified:** `$DSH/package.json` → `"version": "0.1.5-rc.3"`.
+**Version verified:** originally `$DSH/package.json` → `"version": "0.1.5-rc.3"`.
+Re-checked against `"0.1.7-rc.2"`: the browser-transport surface this spec covers
+(webserver routes, the `/api` trust fence, browser-auth cookie exchange,
+`REMOTE_STREAM_MUX_PATH`) is **unchanged**; see `PLUGIN-NOTES.md` §8 for the
+line-by-line re-verification and the few unrelated deltas.
 
 > Every claim below cites an absolute path and a verbatim quote from a file that was
 > actually read. Negative results are stated explicitly. Where a claim could not be

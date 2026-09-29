@@ -1,12 +1,17 @@
-# dsh 0.1.5-rc.3 插件与认证机制 —— 实测笔记
+# dsh 插件与认证机制 —— 实测笔记（0.1.5-rc.3 → 0.1.7-rc.2）
 
-> 全部结论都来自对**已安装的** dsh `0.1.5-rc.3` 源码与 `--dump-config` 实跑结果的核对，
-> 不是推测。凡引用处均给出绝对路径。这份笔记的价值在于：网上（以及本项目的原始需求
-> 文档里）流传的很多说法是错的，照着错的做会浪费大量时间。
+> 全部结论都来自对**已安装的** dsh 源码与 `--dump-config` 实跑结果的核对，不是推测。
+> 凡引用处均给出绝对路径。这份笔记的价值在于：网上（以及本项目的原始需求文档里）
+> 流传的很多说法是错的，照着错的做会浪费大量时间。
+>
+> **版本沿革**：初版核对的是 `0.1.5-rc.3`。后于 `0.1.7-rc.2` 上逐条复核，结论见
+> 「八、0.1.7 复核」——插件运行时用到的 dsh API **一处未变**，唯一需要适配的是
+> 插件清单的兼容性声明方式（`dsh.engines.dsh` 已失效，改为 `peerDependencies`）。
 
 安装位置：`/root/.nvm/versions/node/v24.19.0/lib/node_modules/@deepseek-ai/dsh/`
-包含包：`.../dsh/node_modules/@deepseek-ai/*`（240 个包）
-完整源码仓库：`/root/deepseek-harness`（`packages/` 下有全部 TypeScript 源）
+包含包：`.../dsh/node_modules/@deepseek-ai/*`（0.1.5-rc.3 时 240 个，0.1.7-rc.2 时 283 个）
+完整源码仓库：`/root/deepseek-harness`（**注意：该仓库停在 `0.1.0-rc.8`，不能用来核对
+0.1.5/0.1.7 的行为，只能读已安装的编译产物**）
 
 ---
 
@@ -41,11 +46,39 @@ cannot get property "xxx" without inject 整棵树加载失败」。
     "engines": { "dsh": ">=0.1.5-rc.1" },
     "bundle": { "patch": "./cordis.patch.yml" },
     "client": { "platform": "web", "inject": ["@deepseek-ai/dsh-client-ui-sidebar-right"] }
-  }
+  },
+  "peerDependencies": { "@deepseek-ai/dsh": ">=0.1.5-rc.1" },
+  "peerDependenciesMeta": { "@deepseek-ai/dsh": { "optional": true } }
 }
 ```
 
-`dsh.*` 的子键：`bundle.patch`、`client.{platform,inject}`、`engines.dsh`、`configTrees`。
+`dsh.*` 的子键：`bundle.patch`、`client.{platform,inject}`、`engines.dsh`。
+（`configTrees` 在 0.1.5/0.1.7 两版里都**没有任何读取方**，是死字段。）
+
+**⚠️ 兼容性声明：`dsh.engines.dsh` 已失效，改用 `peerDependencies`（0.1.7 起）。**
+对整个已安装的 0.1.7-rc.2 做全量 grep（`grep -rn "\.engines\b" $DSH --include=*.js`）
+**零命中** —— `dsh.engines.dsh` 现在纯属注释性元数据，不产生任何校验。
+0.1.7 真正的机制是 `peerDependencies` 里以 `@deepseek-ai/dsh` / `@deepseek-ai/dsh-`
+开头的键，实现在 `dsh-app-boot/lib/index.js` 的 `evaluatePluginCompatibility()`：
+
+- 清单里**没有** `peerDependencies` 字段 → 直接返回 `undefined`，**完全不校验**（静默放行）。
+- 有该字段但不满足当前运行时 → 是**硬失败**，不是警告：
+  - 加载期：`loadProfileDirectory()` 抛错，该 bundle 进 `skippedBundles`（插件整层不加载）。
+  - 安装期：`dsh-plugin-manager` 在调 pnpm **之前**预检，直接拒绝安装（"nothing was installed"）。
+- 版本比较用 `semver.satisfies(runtime, range, { includePrerelease: true })`；
+  `workspace:^` / `workspace:~` / `workspace:*` 会被替换成当前运行时版本。
+- 补救手段：`dsh plugin --profile <p> allow-version <name>@<ver> --accept-risk`，
+  写进 profile 目录的 `compatibility.json`（精确 `包名@版本` → 允许的 dsh 版本数组）。
+
+本插件的取值理由：`>=0.1.5-rc.1` 在 0.1.7-rc.2 下 `satisfies` 为真（已实测），
+既拿到了 0.1.7+ 的强制校验，又不会因为 dsh 出补丁版就把自己锁死。
+`peerDependenciesMeta.optional: true` 是必要的：它**不影响** dsh 侧的校验
+（`evaluatePluginCompatibility` 只读 `peerDependencies`，不看 meta），
+但能阻止 `npm install` 在插件目录里自动拉一份 `@deepseek-ai/dsh` 进来。
+（profile 自己的 `pnpm-workspace.yaml` 已带 `autoInstallPeers: false`，pnpm 一侧本来就不会装。）
+
+官方包用精确锁版（如 `"@deepseek-ai/dsh": "0.1.7-rc.2"`）；社区 bundle `dsh-git-vcs@0.1.2`
+仍只写 `dsh.engines.dsh`，即**它目前也没有被强制校验**。
 
 **3. ⚠️ 列进 `bundles` 之后，不要再 `insert` 同一行。**
 把插件加进 profile 的 `dsh.profile.bundles` 之后，插件自己的 patch **已经**插入了一行。
@@ -230,3 +263,65 @@ port: !!js ctx.webStartup.port ?? 3080
 然后 `DSH_HOME=<可写目录> dsh --profile web --port <测试端口> --no-open` 即可在不碰
 用户正在使用的 profile 的前提下真实启动一个带插件的实例。
 完整脚本见 `scripts/e2e-setup.sh`。
+
+---
+
+## 八、0.1.7 复核（针对 0.1.7-rc.2）
+
+对已安装的 `0.1.7-rc.2` 逐条复核本插件用到的每个 dsh API。
+**结论：运行时接口一处未变，本插件在 0.1.7 上开箱可用，无需改代码。**
+实测依据：`bash scripts/e2e-run.sh` → **95/95 通过**（真实 dsh 0.1.7-rc.2，非 mock）。
+
+### 8.1 未变的接口（逐条核对过编译产物）
+
+| 接口 | 位置 | 判定 |
+|---|---|---|
+| `webServer.register({kind,path,handler})` | `dsh-host-webserver/lib/types/index.d.ts` | 签名一致 |
+| `webServer.registerUpgrade({path,handler})` | 同上 | 签名一致 |
+| `webServer.port` / `.host` | 同上 | 一致 |
+| `registerFallback()` 单席位 | 同上（"One owner only"） | 仍单席位，架构理由成立 |
+| `ctx.connection.authenticatedUrl(baseUrl)` | `dsh-client-connection/lib/index.js:600` | 一致，仍返回 `?token=<launchToken>` |
+| `ctx.effect(fn, label)` | cordis | 一致 |
+| launch token 兑换：`GET /?token=` → 303 + `Set-Cookie` | `browser-auth.js` `authorizeIndex()` | 触发条件完全一致（GET + pathname `/` + 恰好一个 token + 可解析 authority） |
+| cookie 名 `dsh-auth-` + base64url(sha256(authority)) | 同上 `cookieName()` | 一致 |
+| cookie 值 `v1.<base64url(payload)>.<base64url(HMAC)>` | 同上 `encodeCookie()` | 一致 |
+| `/api` 信任栅栏 | `isTrustedApiRequest()` | 一致：Host 必需且须回环/trusted；`sec-fetch-site: cross-site` → 拒；Origin 可省略，有则 `.host` 须等于 Host |
+| `REMOTE_STREAM_MUX_PATH = "/api/remote.mux"` | `dsh-api-gateway/lib/index.js:12` | 一致 |
+| `DEFAULT_MAX_REQUEST_BODY_BYTES = 300 MiB` | `dsh-client-connection/lib/index.js:25` | 一致 |
+| `--host 0.0.0.0` 被 CLI 硬拒绝 | `dsh-web-app/lib/startup.js:40` | 仍拒绝，原文未变 |
+
+### 8.2 变了但**不影响**本插件的地方
+
+- **`authorizeIndex()` 的 303 `location` 从 `"/"` 改成 `"./"`**
+  （配合新增的目录相对挂载）。本插件兑换 cookie 时**不跟随重定向**，只读 `set-cookie`
+  响应头，所以无感。
+- **`serveStatic()` 改了签名**：`authorizeIndex` 现在以无参 thunk 传入
+  （`dsh-host-frontend-static/lib/index.js:95`），且 `renderIndex` 会往 index.html 注入
+  `<base href="./">`。本插件不调用 `serveStatic`，只是反向代理 dsh 的响应；
+  网关在根路径提供服务，`./` 解析为 `/`，行为等价。
+- **包数量 240 → 283**，新增包与本插件无关；`dsh-api-remotes` 是内部 `ctx.remote`
+  概念（Host 事件转发白名单），**不是**对外暴露服务的能力，不构成对本插件的替代。
+
+### 8.3 唯一需要适配的：兼容性声明（已改）
+
+`dsh.engines.dsh` 在 0.1.7 里**没有任何读取方**（全量 grep 零命中），
+替换机制是 `peerDependencies`，且不满足时是硬失败而非警告。
+本插件已补上 `peerDependencies` + `peerDependenciesMeta.optional`，理由与实测见
+本文第一节「2. 插件清单」。改完后 `evaluatePluginCompatibility()` 对
+`0.1.7-rc.2` 返回 `undefined`（= 通过校验），e2e 95/95 仍全过。
+
+### 8.4 复核手法（可复用）
+
+```bash
+# 1) 确认某个 dsh.* 字段是否真的有人读（死字段检测）
+grep -rn "\.engines\b" /root/.nvm/versions/node/v24.19.0/lib/node_modules/@deepseek-ai/dsh \
+  --include=*.js | grep -v 'engines":'      # 零命中 = 死字段
+
+# 2) 直接问 0.1.7 自己的兼容性判定函数，不要靠猜 semver
+node --input-type=module -e "
+const { evaluatePluginCompatibility } = await import(
+  '/root/.nvm/versions/node/v24.19.0/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-app-boot/lib/index.js');
+const m = JSON.parse(require('fs').readFileSync('<插件>/package.json','utf8'));
+console.log(evaluatePluginCompatibility(m, {}) ?? 'PASS');
+"
+```
