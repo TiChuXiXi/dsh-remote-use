@@ -1,0 +1,109 @@
+// DshRemote — application module.
+//
+// Sources are NOT moved into src/main/: this module points at the SAME `java/` and `res/`
+// trees the hand-rolled `build_apk.sh` uses, so both pipelines compile byte-for-byte the
+// same inputs. If they ever disagree, that is a bug in this file, not in the sources.
+//
+// `net/` stays PURE Java (zero android.* imports) — nothing here may put an Android/AndroidX
+// artifact on the *main* compile classpath. AndroidX and Robolectric are test-only.
+apply plugin: 'com.android.application'
+
+android {
+    namespace 'com.dsh.remote'
+    compileSdk 35
+    buildToolsVersion '34.0.0'
+
+    defaultConfig {
+        applicationId 'com.dsh.remote'
+        minSdk 26
+        targetSdk 34
+        versionCode 1
+        versionName '1.0'
+    }
+
+    // The manifest already carries package/minSdk/targetSdk; keep it as the shared
+    // source of truth for both pipelines.
+    sourceSets {
+        main {
+            manifest.srcFile '../AndroidManifest.xml'
+            java.srcDirs = ['../java']
+            res.srcDirs = ['../res']
+        }
+        test {
+            java.srcDirs = ['src/test/java']
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+
+    signingConfigs {
+        debug {
+            // AGP's default debug keystore lives in ANDROID_USER_HOME (= .toolchain/android-home
+            // on this host). It is a normal debug key; either pipeline's APK can be installed
+            // over the other only if the signers match, which is why the hand-rolled
+            // build_apk.sh keeps using its own dist/debug.keystore.
+            storeFile file("${System.getenv('ANDROID_USER_HOME')}/debug.keystore")
+        }
+    }
+
+    buildTypes {
+        debug {
+            signingConfig signingConfigs.debug
+            // The hand-rolled pipeline produces v1+v2+v3; ask AGP for the same so the two
+            // APKs are equivalent in what they can be installed on.
+            signingConfig.enableV1Signing = true
+            signingConfig.enableV2Signing = true
+            signingConfig.enableV3Signing = true
+        }
+        release {
+            minifyEnabled false
+            signingConfig signingConfigs.debug
+        }
+    }
+
+    // Robolectric needs the merged resources + manifest of the app under test.
+    testOptions {
+        unitTests {
+            includeAndroidResources = true
+            returnDefaultValues = true
+        }
+    }
+
+    packaging {
+        resources {
+            excludes += ['META-INF/LICENSE*', 'META-INF/NOTICE*', 'META-INF/*.kotlin_module']
+        }
+    }
+
+    lint {
+        abortOnError false
+    }
+}
+
+dependencies {
+    // ---- unit test only (Robolectric). NOTHING here reaches the APK. ----
+    testImplementation 'junit:junit:4.13.2'
+    testImplementation 'org.robolectric:robolectric:4.14.1'
+    testImplementation 'androidx.test:core:1.6.1'
+    testImplementation 'androidx.test.ext:junit:1.2.1'
+}
+
+tasks.withType(Test).configureEach {
+    testLogging {
+        events 'passed', 'failed', 'skipped'
+        exceptionFormat = 'full'
+    }
+    // Robolectric resolves its instrumented android-all jar from Maven Central at test time.
+    systemProperty 'robolectric.dependency.repo.url', 'https://repo.maven.apache.org/maven2'
+    systemProperty 'robolectric.dependency.repo.id', 'central'
+    // Robolectric takes its download lock at "$user.home/.robolectric-download-lock".
+    // `/` is read-only on this host, so point user.home at the repo toolchain instead.
+    systemProperty 'user.home', rootProject.file('../.toolchain/robolectric-home').absolutePath
+    doFirst {
+        file("${rootProject.projectDir}/../.toolchain/robolectric-home").mkdirs()
+    }
+    maxHeapSize = '2g'
+}

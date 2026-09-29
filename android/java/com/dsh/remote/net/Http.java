@@ -10,6 +10,8 @@ import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.charset.Charset;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.security.SecureRandom;
 import java.security.cert.CertificateException;
 import java.security.cert.X509Certificate;
@@ -207,6 +209,20 @@ public final class Http {
 
     /** multipart/form-data POST with field {@code path}=&lt;relPath&gt; (omitted when null) and field {@code file}=&lt;file&gt;. */
     public Response uploadFile(String relPath, File file) throws IOException {
+        return uploadFile(relPath, file, null);
+    }
+
+    /**
+     * Same as {@link #uploadFile(String, File)} but lets the caller choose the multipart
+     * {@code filename}. Pass {@code null} to fall back to {@code file.getName()}.
+     *
+     * <p>Why this exists: the picker path copies the picked document into a cache file
+     * ({@code upload-<millis>}), so {@code file.getName()} is a meaningless temp name. The
+     * server derives the stored name from the separate {@code path} field, but any server
+     * (or log, or downstream tool) that keys off the multipart {@code filename} would
+     * record the temp name. Callers that know the real name must pass it here.
+     */
+    public Response uploadFile(String relPath, File file, String filenameOverride) throws IOException {
         if (file == null) {
             throw new IllegalArgumentException("file must not be null");
         }
@@ -214,7 +230,9 @@ public final class Http {
             throw new IOException("not a readable file: " + file.getAbsolutePath());
         }
         String boundary = randomBoundary();
-        String filename = file.getName();
+        String filename = (filenameOverride == null || filenameOverride.isEmpty())
+                ? file.getName()
+                : filenameOverride;
         byte[] pathPart = null;
         byte[] relPathBytes = null;
         if (relPath != null && !relPath.isEmpty()) {
@@ -274,6 +292,129 @@ public final class Http {
                 conn.disconnect();
             }
         }
+    }
+
+    /**
+     * POST a byte range of {@code file} as the raw request body
+     * ({@code Content-Type: application/octet-stream}) with a fixed {@code Content-Length},
+     * streamed from disk. This is the transport for chunked upload (mode B, one chunk per
+     * request) — see {@link GatewayClient#uploadChunked}.
+     *
+     * <p>Why a range and not a {@code byte[]}: a chunk is 4 MiB by default and the whole
+     * point of mode B is to upload files far larger than the heap. Nothing here ever holds
+     * more than one {@link #STREAM_CHUNK} buffer.</p>
+     *
+     * <p>{@code offset + length} must lie inside the file; a violation is an
+     * {@link IOException} raised before any request is sent, not a truncated upload.</p>
+     */
+    public Response postFileRange(String path, File file, long offset, long length,
+                                  Map<String, String> extraHeaders) throws IOException {
+        if (file == null) {
+            throw new IllegalArgumentException("file must not be null");
+        }
+        if (!file.isFile()) {
+            throw new IOException("not a readable file: " + file.getAbsolutePath());
+        }
+        long fileLength = file.length();
+        if (offset < 0 || length < 0 || offset > fileLength || length > fileLength - offset) {
+            throw new IOException("range " + offset + "+" + length + " is outside "
+                    + file.getAbsolutePath() + " (" + fileLength + " bytes)");
+        }
+        HttpURLConnection conn = null;
+        try {
+            conn = open(fullUrl(path));
+            applyCommon(conn);
+            conn.setRequestMethod("POST");
+            conn.setInstanceFollowRedirects(false);
+            conn.setDoOutput(true);
+            conn.setFixedLengthStreamingMode(length);
+            conn.setRequestProperty("Content-Type", "application/octet-stream");
+            conn.setRequestProperty("Accept", ACCEPT_JSON);
+            if (extraHeaders != null) {
+                for (Map.Entry<String, String> e : extraHeaders.entrySet()) {
+                    if (e.getKey() != null && e.getValue() != null) {
+                        conn.setRequestProperty(e.getKey(), e.getValue());
+                    }
+                }
+            }
+            if (bearer != null) {
+                conn.setRequestProperty("Authorization", "Bearer " + bearer);
+            }
+            FileInputStream in = new FileInputStream(file);
+            try {
+                long skipped = 0;
+                while (skipped < offset) {
+                    long s = in.skip(offset - skipped);
+                    if (s <= 0) {
+                        throw new IOException("cannot seek to offset " + offset + " in "
+                                + file.getAbsolutePath());
+                    }
+                    skipped += s;
+                }
+                OutputStream out = conn.getOutputStream();
+                try {
+                    byte[] buf = new byte[STREAM_CHUNK];
+                    long left = length;
+                    while (left > 0) {
+                        int n = in.read(buf, 0, (int) Math.min((long) buf.length, left));
+                        if (n < 0) {
+                            throw new IOException("unexpected end of " + file.getAbsolutePath()
+                                    + " while sending " + length + " bytes from offset " + offset);
+                        }
+                        out.write(buf, 0, n);
+                        left -= n;
+                    }
+                    out.flush();
+                } finally {
+                    out.close();
+                }
+            } finally {
+                in.close();
+            }
+            int status = conn.getResponseCode();
+            InputStream in2 = (status >= 200 && status < 300) ? conn.getInputStream() : conn.getErrorStream();
+            byte[] bytes = readAll(in2);
+            String text = (bytes == null) ? null : new String(bytes, UTF8);
+            return new Response(status, text, bytes, conn.getHeaderFields());
+        } finally {
+            if (conn != null) {
+                conn.disconnect();
+            }
+        }
+    }
+
+    /**
+     * Streaming SHA-256 of a file, lowercase hex. Reads in {@link #STREAM_CHUNK} blocks, so
+     * the file is never held in memory — the gateway verifies the whole-file hash after
+     * merging the chunks (docs/GATEWAY-API.md §2.3, {@code X-File-SHA256}).
+     */
+    public static String sha256Hex(File file) throws IOException {
+        if (file == null) {
+            throw new IllegalArgumentException("file must not be null");
+        }
+        MessageDigest md;
+        try {
+            md = MessageDigest.getInstance("SHA-256");
+        } catch (NoSuchAlgorithmException e) {
+            throw new IOException("SHA-256 unavailable: " + e);
+        }
+        InputStream in = new FileInputStream(file);
+        try {
+            byte[] buf = new byte[STREAM_CHUNK];
+            int n;
+            while ((n = in.read(buf)) != -1) {
+                md.update(buf, 0, n);
+            }
+        } finally {
+            in.close();
+        }
+        byte[] digest = md.digest();
+        StringBuilder sb = new StringBuilder(digest.length * 2);
+        for (byte b : digest) {
+            sb.append(HEX[(b >> 4) & 0x0F]);
+            sb.append(HEX[b & 0x0F]);
+        }
+        return sb.toString();
     }
 
     /** application/x-www-form-urlencoded style percent-encoding; space becomes %20 (not '+'). */

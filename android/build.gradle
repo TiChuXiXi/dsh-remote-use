@@ -1,0 +1,18 @@
+// DshRemote — root build script (the module is app/build.gradle).
+//
+// There is deliberately no third-party plugin beyond the Android Gradle Plugin: the APK
+// still ships ZERO runtime dependencies (no AndroidX, no OkHttp, no Gson). AndroidX and
+// Robolectric appear only on the unit-test classpath.
+buildscript {
+    repositories {
+        google()
+        mavenCentral()
+    }
+    dependencies {
+        classpath 'com.android.tools.build:gradle:8.5.2'
+    }
+}
+
+tasks.register('clean', Delete) {
+    delete rootProject.layout.buildDirectory
+}

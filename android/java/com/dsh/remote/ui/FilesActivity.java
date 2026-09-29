@@ -1,14 +1,19 @@
 package com.dsh.remote.ui;
 
 import android.app.Activity;
+import android.content.ContentResolver;
+import android.content.ContentValues;
 import android.content.Intent;
 import android.database.Cursor;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
+import android.provider.MediaStore;
 import android.provider.OpenableColumns;
 import android.view.View;
 import android.view.ViewGroup;
+import android.webkit.MimeTypeMap;
 import android.widget.AdapterView;
 import android.widget.BaseAdapter;
 import android.widget.Button;
@@ -20,6 +25,7 @@ import com.dsh.remote.net.GatewayClient;
 import com.dsh.remote.net.Json;
 
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
@@ -28,18 +34,47 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 /**
- * Workspace file browser over {@code /fs/list} with breadcrumb + Up navigation,
- * tap-a-file download into {@code getExternalFilesDir(DIRECTORY_DOWNLOADS)} (no runtime
- * permission needed) and a document-picker upload via {@code GatewayClient.upload}.
+ * Workspace file browser over {@code /fs/list} with breadcrumb + Up navigation, tap-a-file
+ * download and a document-picker upload.
+ *
+ * <p><b>Downloads</b>: on API 29+ the file is published into the public
+ * {@code MediaStore.Downloads} collection, so it shows up in the system Downloads app; on
+ * API 26–28 (where {@code MediaStore.Downloads} does not exist) it falls back to
+ * {@code getExternalFilesDir(DIRECTORY_DOWNLOADS)}. Neither route needs a runtime storage
+ * permission, so the app requests none — in particular <b>not</b>
+ * {@code WRITE_EXTERNAL_STORAGE}.</p>
+ *
+ * <p><b>Uploads</b>: small files go as a single multipart request (mode A); files at or above
+ * {@link #CHUNKED_UPLOAD_THRESHOLD_BYTES} go as 4 MiB chunks (mode B) with per-chunk progress
+ * in the status line.</p>
  */
 public final class FilesActivity extends Activity {
 
     private static final int REQ_UPLOAD = 1001;
+
+    /**
+     * Size at which uploads switch from mode A (one multipart request) to mode B (4 MiB
+     * chunks). The tradeoff:
+     *
+     * <ul>
+     *   <li>Mode A is a single round trip and is what the verified small-file path uses, but
+     *       the gateway stages the whole body in {@code stateDir} and then copies it to the
+     *       target directory (root README, 已知限制), and a failure anywhere means re-sending
+     *       the entire file.</li>
+     *   <li>Mode B writes each chunk straight into the chunk session and merges once, and a
+     *       failed chunk only costs that chunk — but it costs one request per 4 MiB.</li>
+     * </ul>
+     *
+     * 8 MiB (two chunks) is where the cost of "one failure re-sends everything" starts to
+     * outweigh the cost of extra requests. Below it, mode A is left exactly as it was.
+     */
+    private static final long CHUNKED_UPLOAD_THRESHOLD_BYTES = 8L * 1024 * 1024;
 
     private TextView breadcrumbView;
     private TextView statusView;
@@ -187,21 +222,20 @@ public final class FilesActivity extends Activity {
             @Override
             public void run() {
                 try {
-                    File dir = FilesActivity.this.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS);
-                    if (dir == null) {
-                        FilesActivity.this.status("download failed: no external files dir");
-                        return;
+                    final String savedAt;
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                        savedAt = downloadIntoPublicDownloads(relPath, name);
+                    } else {
+                        savedAt = downloadIntoAppDir(relPath, name);
                     }
-                    final File dest = new File(dir, name);
-                    FilesActivity.this.gc().download(relPath, dest, true);
                     FilesActivity.this.runOnUiThread(new Runnable() {
                         @Override
                         public void run() {
                             if (destroyed) {
                                 return;
                             }
-                            statusView.setText("Saved: " + dest.getAbsolutePath());
-                            App.toast(FilesActivity.this, dest.getAbsolutePath());
+                            statusView.setText("Saved: " + savedAt);
+                            App.toast(FilesActivity.this, savedAt);
                         }
                     });
                 } catch (Exception e) {
@@ -209,6 +243,140 @@ public final class FilesActivity extends Activity {
                 }
             }
         });
+    }
+
+    /**
+     * API 26–28 fallback: app-private external storage. Needs no runtime permission, but the
+     * file is invisible to the system Downloads app (and to every other app).
+     *
+     * @return the absolute path shown to the user
+     */
+    private String downloadIntoAppDir(String relPath, String name) throws IOException {
+        File dir = getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS);
+        if (dir == null) {
+            throw new IOException("no external files dir");
+        }
+        File dest = new File(dir, name);
+        gc().download(relPath, dest, true);
+        return dest.getAbsolutePath();
+    }
+
+    /**
+     * API 29+: insert a row into the public {@code MediaStore.Downloads} collection, stream the
+     * file into it, then publish it by clearing {@code IS_PENDING}.
+     *
+     * <p><b>Why a temp file instead of downloading straight into the MediaStore stream:</b>
+     * {@code openOutputStream} hands back a write-only, non-seekable stream, while Range resume
+     * needs both the bytes already on disk <em>and</em> their length to build
+     * {@code Range: bytes=<n>-}. So resume keeps using the verified
+     * {@code Http.downloadTo(path, File, resume)} against a {@code .part-} staging file, and the
+     * finished file is copied into the MediaStore stream afterwards. That costs one extra full
+     * copy (the same tradeoff mode-A uploads already make on the gateway side) and buys an
+     * unchanged, still-verified resume path for large downloads.</p>
+     *
+     * <p><b>Failure:</b> the row is inserted with {@code IS_PENDING=1}, which already hides it
+     * from the system Downloads app, and is deleted outright if anything fails — no broken or
+     * zero-byte row is left behind. The staging file is kept on purpose so the next attempt can
+     * resume it.</p>
+     *
+     * @return the user-visible path ("Download/&lt;name&gt;")
+     */
+    private String downloadIntoPublicDownloads(String relPath, String name) throws IOException {
+        ContentResolver cr = getContentResolver();
+        ContentValues values = new ContentValues();
+        values.put(MediaStore.Downloads.DISPLAY_NAME, name);
+        values.put(MediaStore.Downloads.MIME_TYPE, mimeTypeOf(name));
+        values.put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS);
+        values.put(MediaStore.Downloads.IS_PENDING, 1);
+        Uri row = cr.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values);
+        if (row == null) {
+            throw new IOException("MediaStore refused the download row for " + name);
+        }
+        try {
+            File part = stagingFileFor(name);
+            gc().download(relPath, part, true);   // resume: the verified File-based path
+            OutputStream out = cr.openOutputStream(row, "w");
+            if (out == null) {
+                throw new IOException("MediaStore gave no output stream for " + name);
+            }
+            try {
+                copyFile(part, out);
+            } finally {
+                try {
+                    out.close();
+                } catch (IOException ignore) {
+                    // already closed / nothing to do
+                }
+            }
+            ContentValues published = new ContentValues();
+            published.put(MediaStore.Downloads.IS_PENDING, 0);
+            cr.update(row, published, null, null);
+            part.delete();
+            return Environment.DIRECTORY_DOWNLOADS + "/" + name;
+        } catch (Exception e) {
+            // No half-written, zero-byte or unpublished-but-orphaned row: drop it.
+            try {
+                cr.delete(row, null, null);
+            } catch (RuntimeException ignore) {
+                // the row is gone already, or MediaStore is unavailable — nothing more to do
+            }
+            if (e instanceof IOException) {
+                throw (IOException) e;
+            }
+            throw new IOException("MediaStore download failed: " + messageOf(e), e);
+        }
+    }
+
+    /**
+     * The staging file for a MediaStore download, named {@code .part-<name>} so it can never be
+     * mistaken for a finished download. Lives in the app-private dir (resumable across app
+     * restarts, no permission) and falls back to the internal cache when external storage is
+     * not mounted.
+     */
+    private File stagingFileFor(String name) throws IOException {
+        File dir = getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS);
+        if (dir == null) {
+            dir = getCacheDir();
+        }
+        if (dir == null) {
+            throw new IOException("no writable directory for the download");
+        }
+        if (!dir.isDirectory() && !dir.mkdirs()) {
+            throw new IOException("cannot create " + dir.getAbsolutePath());
+        }
+        return new File(dir, ".part-" + name);
+    }
+
+    private static void copyFile(File src, OutputStream out) throws IOException {
+        InputStream in = new FileInputStream(src);
+        try {
+            byte[] buf = new byte[64 * 1024];
+            int n;
+            while ((n = in.read(buf)) > 0) {
+                out.write(buf, 0, n);
+            }
+            out.flush();
+        } finally {
+            in.close();
+        }
+    }
+
+    /**
+     * MIME type for the MediaStore row. {@code MimeTypeMap} is Android's own table; the
+     * {@code URLConnection} guess and finally {@code application/octet-stream} cover
+     * extensions Android's table does not know.
+     */
+    private static String mimeTypeOf(String name) {
+        int dot = name.lastIndexOf('.');
+        if (dot >= 0 && dot < name.length() - 1) {
+            String ext = name.substring(dot + 1).toLowerCase(Locale.US);
+            String mime = MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext);
+            if (mime != null && !mime.isEmpty()) {
+                return mime;
+            }
+        }
+        String guessed = java.net.URLConnection.guessContentTypeFromName(name);
+        return (guessed == null || guessed.isEmpty()) ? "application/octet-stream" : guessed;
     }
 
     private void pickUpload() {
@@ -266,7 +434,39 @@ public final class FilesActivity extends Activity {
                         }
                     }
                     final String rel = sanitizeName(displayName);
-                    FilesActivity.this.gc().upload(rel, tmp);
+                    final long size = tmp.length();
+                    if (size >= CHUNKED_UPLOAD_THRESHOLD_BYTES) {
+                        // Mode B: one request per 4 MiB chunk, progress in the status line.
+                        // The array is the "last progress seen" holder the failure message
+                        // needs — anonymous inner classes cannot write a captured local.
+                        final int[] sent = new int[] {0, 0};
+                        GatewayClient.UploadProgress progress = new GatewayClient.UploadProgress() {
+                            @Override
+                            public void chunkSent(int chunkIndex, int totalChunks,
+                                                  long bytesSent, long totalBytes) {
+                                sent[0] = chunkIndex;
+                                sent[1] = totalChunks;
+                                FilesActivity.this.status("Uploading " + rel + "\u2026 "
+                                        + chunkIndex + "/" + totalChunks + " chunks ("
+                                        + humanSize(bytesSent) + " of " + humanSize(totalBytes) + ")");
+                            }
+                        };
+                        try {
+                            FilesActivity.this.gc().uploadChunked(rel, tmp, rel, progress);
+                        } catch (IOException e) {
+                            // Surface how far the upload got: the file itself is discarded
+                            // (it is a cache copy), so the chunk count is the only progress
+                            // the user can act on.
+                            throw new IOException(messageOf(e) + "（已发送 " + sent[0] + "/"
+                                    + sent[1] + " 块）", e);
+                        }
+                    } else {
+                        // Mode A: unchanged single multipart request.
+                        // 第三个参数是 multipart 的 filename。tmp 是个缓存临时文件
+                        // （upload-<millis>），不传真实名字的话，wire 上写的会是那个临时名。
+                        // 服务端以 path 字段为准所以结果本来就对，但日志/下游工具会记错名字。
+                        FilesActivity.this.gc().upload(rel, tmp, rel);
+                    }
                     FilesActivity.this.status("uploaded " + rel);
                 } catch (Exception e) {
                     FilesActivity.this.status("upload failed: " + messageOf(e));

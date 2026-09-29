@@ -142,6 +142,24 @@ public final class Http {
     /** multipart/form-data POST with field `path`=<relPath> (omitted when null) and field `file`=<file>. */
     public Response uploadFile(String relPath, java.io.File file) throws java.io.IOException;
 
+    /**
+     * Same, but with an explicit multipart `filename`. Pass the real name when `file` is a
+     * temp copy (the document-picker path copies to `cacheDir/upload-<millis>`).
+     * null/empty -> falls back to `file.getName()`.
+     */
+    public Response uploadFile(String relPath, java.io.File file, String filenameOverride) throws java.io.IOException;
+
+    /**
+     * POST a byte RANGE of a file as the raw body (`application/octet-stream`) — the
+     * chunked-upload (mode B) primitive. Streamed in 64 KiB blocks; range bounds are
+     * validated before any request is sent.
+     */
+    public Response postFileRange(String path, java.io.File file, long offset, long length,
+                                  java.util.Map<String,String> extraHeaders) throws java.io.IOException;
+
+    /** Streaming SHA-256 of a file, lowercase hex. */
+    public static String sha256Hex(java.io.File file) throws java.io.IOException;
+
     public static String urlEncode(String s);      // application/x-www-form-urlencoded style (space -> %20)
 
     public static final class Response {
@@ -286,10 +304,38 @@ public final class GatewayClient {
     public java.util.List<Object> fsList(String relPath) throws java.io.IOException;
     /** Full parsed body of GET /fs/list. */
     public Object fsListRaw(String relPath) throws java.io.IOException;
-    /** GET /fs/download -> file, with Range resume. Returns bytes on disk after the call. */
+    /** GET /fs/download -> file, with Range resume. Returns bytes on disk after the call.
+     *  Throws GatewayException on a non-2xx status (a 403 leaves no file behind, so
+     *  returning dest.length() would report success for a download that never happened). */
     public long download(String relPath, java.io.File dest, boolean resume) throws java.io.IOException;
     /** POST /fs/upload (multipart, mode A). Returns the parsed body. */
     public Object upload(String relPath, java.io.File file) throws java.io.IOException;
+    /** Mode A with an explicit multipart `filename` (see Http.uploadFile). */
+    public Object upload(String relPath, java.io.File file, String filename) throws java.io.IOException;
+
+    /** Chunk size for mode B. 4 MiB — deliberately below the gateway's maxUploadBytes (2 GiB)
+     *  and the reverse proxy's replayBodyLimitBytes (64 MiB), so a chunk meeting a dsh restart
+     *  can be replayed rather than 502'd. */
+    public static final int CHUNK_SIZE_BYTES = 4 * 1024 * 1024;
+
+    /** Progress callback for uploadChunked; called after each chunk is accepted. */
+    public interface UploadProgress { void onChunk(int sent, int total, long bytesSent, long bytesTotal); }
+
+    /** Result of a completed mode-B upload. */
+    public static final class ChunkedUploadResult {
+        public final boolean completed; public final int receivedChunks; public final int totalChunks;
+        public final String path; public final long size; public final String sha256;
+    }
+
+    /**
+     * POST /fs/upload in chunked mode B: one request per CHUNK_SIZE_BYTES, with
+     * X-Upload-Id / X-Chunk-Index / X-Total-Chunks / X-File-Path / X-File-Name / X-File-SHA256.
+     * The whole-file SHA-256 is sent on EVERY chunk (the gateway only reads it off the
+     * completing request, so first-chunk-only would silently skip verification).
+     * Aborts on the first rejected chunk; never reports a partial upload as success.
+     */
+    public ChunkedUploadResult uploadChunked(String relPath, java.io.File file, String filename,
+                                             UploadProgress progress) throws java.io.IOException;
 }
 ```
 

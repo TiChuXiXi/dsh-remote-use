@@ -1,0 +1,49 @@
+#!/bin/bash
+# android/gradlew — the Gradle entry point for this project.
+#
+# This is NOT the stock Gradle wrapper. The stock wrapper downloads its distribution into
+# ~/.gradle, and on this host `/` is mounted read-only, so ~/.gradle cannot exist. This
+# script pins everything to a toolchain that lives INSIDE the repository:
+#
+#   .toolchain/gradle-8.7/       Gradle 8.7 distribution
+#   .toolchain/gradle-home/      GRADLE_USER_HOME (caches, dependency jars)
+#   .toolchain/android-sdk/      SDK: platforms/android-35 + build-tools/34.0.0 (qemu aapt2)
+#
+# and JAVA_HOME to the JDK 17 required by AGP (the system `java` is JDK 8 and will not do).
+#
+# Usage:  ./gradlew <tasks>            e.g. ./gradlew :app:assembleDebug
+#         ./gradlew :app:testDebugUnitTest
+set -euo pipefail
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+TC="$HERE/../.toolchain"
+
+GRADLE_HOME_DIR="$TC/gradle-8.7"
+JDK="$TC/jdk-17"
+SDK="$TC/android-sdk"
+
+# The JDK is the only toolchain piece that still lives outside the repo (it was already
+# installed and is read-only, which is fine). Allow an override for a relocated checkout.
+if [ ! -x "$JDK/bin/java" ]; then
+    JDK="/root/project/face/android-sdk/.tooling/jdk-17.0.20.1+1"
+fi
+
+for f in "$GRADLE_HOME_DIR/bin/gradle" "$JDK/bin/java" "$SDK/platforms/android-35/android.jar"; do
+    [ -e "$f" ] || { echo "ERROR: missing toolchain piece: $f" >&2; exit 2; }
+done
+
+export JAVA_HOME="$JDK"
+export PATH="$JAVA_HOME/bin:$PATH"
+export GRADLE_USER_HOME="$TC/gradle-home"
+export ANDROID_HOME="$SDK"
+export ANDROID_SDK_ROOT="$SDK"
+# AGP wants ~/.android (analytics settings + the debug keystore). `/` is read-only here,
+# so redirect that into the repo toolchain as well.
+export ANDROID_USER_HOME="$TC/android-home"
+mkdir -p "$GRADLE_USER_HOME" "$ANDROID_USER_HOME"
+
+exec "$GRADLE_HOME_DIR/bin/gradle" \
+    --project-dir "$HERE" \
+    --no-daemon \
+    -Dorg.gradle.java.home="$JAVA_HOME" \
+    "$@"

@@ -3,6 +3,12 @@
     package="com.dsh.remote">
 
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Local notifications for turn completions / approval requests. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- The watcher is a foreground service: Android otherwise kills it within minutes.
+         targetSdk 34 also requires the type-specific permission below. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
 
     <uses-sdk
         android:minSdkVersion="26"
@@ -35,5 +41,12 @@
         <activity
             android:name=".ui.FilesActivity"
             android:exported="false" />
+
+        <!-- Keeps the gateway mux open while the app is backgrounded and posts the event
+             notifications. Not exported: nothing outside the app may start it. -->
+        <service
+            android:name=".ui.GatewayWatchService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
     </application>
 </manifest>
